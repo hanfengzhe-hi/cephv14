@@ -21,13 +21,14 @@
 #include "erasure-code/ErasureCodeInterface.h"
 #include "PGTransaction.h"
 #include "ExtentCache.h"
-
+#include "hi_coreutil.h"
 namespace ECTransaction {
   struct WritePlan {
     PGTransactionUPtr t;
     bool invalidates_cache = false; // Yes, both are possible
     map<hobject_t,extent_set> to_read;
     map<hobject_t,extent_set> will_write; // superset of to_read
+    map<hobject_t,extent_set> to_read_chunk_align;
 
     map<hobject_t,ECUtil::HashInfoRef> hash_infos;
   };
@@ -38,6 +39,7 @@ namespace ECTransaction {
 
   template <typename F>
   WritePlan get_write_plan(
+    bool partial_write,
     const ECUtil::stripe_info_t &sinfo,
     PGTransactionUPtr &&t,
     F &&get_hinfo,
@@ -50,6 +52,12 @@ namespace ECTransaction {
 
 	uint64_t projected_size =
 	  hinfo->get_projected_total_logical_size(sinfo);
+	uint64_t chunk_size = sinfo.get_chunk_size();
+	ceph_assert(chunk_size);
+	ldpp_dout(dpp, 20) << __func__ << ": projected_size=" << projected_size
+	  << "  projected_total_chunk_size=" << hinfo->get_projected_total_chunk_size()
+	  << "  stripe_width=" << sinfo.get_stripe_width() << "  chunk_size=" << chunk_size
+	  << "  partial_write=" << partial_write << dendl;
 
 	if (i.second.deletes_first()) {
 	  ldpp_dout(dpp, 20) << __func__ << ": delete, setting projected size"
@@ -63,6 +71,7 @@ namespace ECTransaction {
 
 	  ECUtil::HashInfoRef shinfo = get_hinfo(source);
 	  projected_size = shinfo->get_projected_total_logical_size(sinfo);
+	  ldpp_dout(dpp, 20) << __func__ << ": second.has_source projected_size=" << projected_size<<dendl;
 	  plan.hash_infos[source] = shinfo;
 	}
 
@@ -83,6 +92,7 @@ namespace ECTransaction {
 	  }
 	  projected_size = sinfo.logical_to_next_stripe_offset(
 	    i.second.truncate->first);
+	  ldpp_dout(dpp, 20) << __func__ << ": i.second.truncate projected_size=" << projected_size<<dendl;
 	}
 
 	extent_set raw_write_set;
@@ -94,6 +104,7 @@ namespace ECTransaction {
 	      "CloneRange is not allowed, do_op should have returned ENOTSUPP");
 	  }
 	  raw_write_set.insert(extent.get_off(), extent.get_len());
+	  ldpp_dout(dpp, 20) << __func__ << ": extent.get_off()=" << extent.get_off() << " extent.get_len()=" << extent.get_len() << dendl;
 	}
 
 	auto orig_size = projected_size;
@@ -104,6 +115,8 @@ namespace ECTransaction {
 	    sinfo.logical_to_prev_stripe_offset(extent.get_start());
 	  uint64_t head_finish =
 	    sinfo.logical_to_next_stripe_offset(extent.get_start());
+	  ldpp_dout(dpp, 20) << __func__ << ": head_start=" << head_start << " head_finish=" << head_finish
+	   << "  projected_size=" << projected_size << " orig_size=" << orig_size << dendl;
 	  if (head_start > projected_size) {
 	    head_start = projected_size;
 	  }
@@ -124,6 +137,8 @@ namespace ECTransaction {
 	  uint64_t tail_finish =
 	    sinfo.logical_to_next_stripe_offset(
 	      extent.get_start() + extent.get_len());
+	  ldpp_dout(dpp, 20) << __func__ <<"tail_start=" <<tail_start<<"tail_finish="<<tail_finish<<
+	    "   orig_size="<<orig_size<<dendl;
 	  if (tail_start != tail_finish &&
 	      (head_start == head_finish || tail_start != head_start) &&
 	      tail_start < orig_size) {
@@ -143,11 +158,22 @@ namespace ECTransaction {
 	      );
 	    will_write.union_insert(
 	      head_start, tail_finish - head_start);
+	    ldpp_dout(dpp, 20) << __func__ << ": head_start != taik_finish " << head_start << "!=" <<tail_finish<< dendl;
 	    if (tail_finish > projected_size)
 	      projected_size = tail_finish;
 	  } else {
 	    ceph_assert(tail_finish <= projected_size);
 	  }
+	    uint64_t hi_head_start = 0, hi_head_len = 0;
+
+	    if(
+	        partial_write && HiSetWriteSection(extent.get_start(), extent.get_len(), chunk_size, hi_head_start, hi_head_len)
+	    ) {
+	      plan.to_read_chunk_align[i.first].union_insert(hi_head_start, hi_head_len);
+	    } else {
+	      plan.to_read_chunk_align[i.first] = will_write;
+	      partial_write = false;
+	    }
 	}
 
 	if (i.second.truncate &&
@@ -161,7 +187,22 @@ namespace ECTransaction {
 				  truncating_to - projected_size);
 	  projected_size = truncating_to;
 	}
-
+	 if (partial_write) {
+	     if(plan.to_read.count(i.first) != 0) {
+		 map<uint64_t, uint64_t> write_set;
+		 raw_write_set.move_into(write_set);
+		 map<uint64_t, uint64_t> to_read;
+		 plan.to_read[i.first].move_into(to_read);
+		 ldpp_dout(dpp, 20) << __func__ << ": partial_write=" << partial_write << " write_set=" << write_set
+		     << " to_read=" << to_read << dendl;
+                 if(HiRebuildToread(write_set, chunk_size, to_read)) {
+	             ldpp_dout(dpp, 20) << __func__ << ": to_read=" << to_read << dendl;
+		     plan.to_read[i.first].clear();
+		     plan.to_read[i.first].insert(extent_set(to_read));
+		 }
+	     }
+	 }
+	 
 	ldpp_dout(dpp, 20) << __func__ << ": " << i.first
 			   << " projected size "
 			   << projected_size
@@ -191,9 +232,13 @@ namespace ECTransaction {
     vector<pg_log_entry_t> &entries,
     map<hobject_t,extent_map> *written,
     map<shard_id_t, ObjectStore::Transaction> *transactions,
+    set<shard_id_t> &read_sid,
     set<hobject_t> *temp_added,
     set<hobject_t> *temp_removed,
-    DoutPrefixProvider *dpp);
+    DoutPrefixProvider *dpp,
+    bool &have_append);
+
 };
+
 
 #endif

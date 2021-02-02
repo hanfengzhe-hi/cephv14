@@ -155,6 +155,7 @@ ostream &operator<<(ostream &lhs, const ECBackend::Op &rhs)
       << " pending_commit=" << rhs.pending_commit
       << " plan.to_read=" << rhs.plan.to_read
       << " plan.will_write=" << rhs.plan.will_write
+      << " plan.to_read_chunk_align=" << rhs.plan.to_read_chunk_align
       << ")";
   return lhs;
 }
@@ -188,6 +189,12 @@ void ECBackend::RecoveryOp::dump(Formatter *f) const
   f->dump_stream("extent_requested") << extent_requested;
 }
 
+static void log_on_exit(void *p)
+{
+}
+
+static OnExitManager exit_callbacks;
+
 ECBackend::ECBackend(
   PGBackend::Listener *pg,
   const coll_t &coll,
@@ -201,6 +208,8 @@ ECBackend::ECBackend(
     sinfo(ec_impl->get_data_chunk_count(), stripe_width) {
   ceph_assert((ec_impl->get_data_chunk_count() *
 	  ec_impl->get_chunk_size(stripe_width)) == stripe_width);
+
+  exit_callbacks.add_callback(log_on_exit, nullptr);
 }
 
 PGBackend::RecoveryHandle *ECBackend::open_recovery_op()
@@ -795,12 +804,14 @@ bool ECBackend::_handle_message(
     MOSDECSubOpWrite *op = static_cast<MOSDECSubOpWrite*>(
       _op->get_nonconst_req());
     parent->maybe_preempt_replica_scrub(op->op.soid);
+    dout(20) << __func__ << ": handle message MSG_OSD_EC_WRITE" << *_op->get_req() << dendl;
     handle_sub_write(op->op.from, _op, op->op, _op->pg_trace);
     return true;
   }
   case MSG_OSD_EC_WRITE_REPLY: {
     const MOSDECSubOpWriteReply *op = static_cast<const MOSDECSubOpWriteReply*>(
       _op->get_req());
+    dout(20) << __func__ << ": handle message MSG_OSD_EC_WRITE_REPLY" << *_op->get_req() << dendl;
     handle_sub_write_reply(op->op.from, op->op, _op->pg_trace);
     return true;
   }
@@ -1167,6 +1178,7 @@ void ECBackend::handle_sub_read_reply(
     return;
   }
   ReadOp &rop = iter->second;
+  dout(20) << __func__ << ": rop=" << rop << dendl;
   for (auto i = op.buffers_read.begin();
        i != op.buffers_read.end();
        ++i) {
@@ -1178,6 +1190,7 @@ void ECBackend::handle_sub_read_reply(
     }
     list<boost::tuple<uint64_t, uint64_t, uint32_t> >::const_iterator req_iter =
       rop.to_read.find(i->first)->second.to_read.begin();
+    bool partial_read = rop.to_read.find(i->first)->second.partial_read;
     list<
       boost::tuple<
 	uint64_t, uint64_t, map<pg_shard_t, bufferlist> > >::iterator riter =
@@ -1187,12 +1200,35 @@ void ECBackend::handle_sub_read_reply(
 	 ++j, ++req_iter, ++riter) {
       ceph_assert(req_iter != rop.to_read.find(i->first)->second.to_read.end());
       ceph_assert(riter != rop.complete[i->first].returned.end());
-      pair<uint64_t, uint64_t> adjusted =
-	sinfo.aligned_offset_len_to_chunk(
+      if(!partial_read){
+        pair<uint64_t, uint64_t> adjusted = sinfo.aligned_offset_len_to_chunk(
 	  make_pair(req_iter->get<0>(), req_iter->get<1>()));
-      ceph_assert(adjusted.first == j->first);
-      riter->get<2>()[from].claim(j->second);
+        ceph_assert(adjusted.first == j->first);
+        riter->get<2>()[from].claim(j->second);
+    }else{
+     while (req_iter != rop.to_read.find(i->first)->second.to_read.end()) {
+       //uint64_t off = sinfo.logical_to_prev_chunk_offset(req_iter->get<0>());
+       set<int> shards;
+
+       HiEcInfo ec_info(ec_impl->get_data_chunk_count(), ec_impl->get_chunk_count(),
+		        ec_impl->get_chunk_mapping(), sinfo.get_chunk_size(),
+			sinfo.get_stripe_width());
+       HiGetRelatedShards(make_pair(req_iter->get<0>(), req_iter->get<1>()), ec_info, shards);
+
+       //get_off_len_shards(req_iter->get<0>(), req_iter->get<1>()), ec_info, shards);
+        dout(20) << __func__ <<" shards:" << shards << "req" << *req_iter << "from:"
+		<< from << "j:" << *j << dendl;
+	if (shards.find(from.shard) != shards.end()) {
+	  riter->get<2>()[from].claim(j->second);
+	  break;
+	} else {
+	  req_iter++;
+	  riter++;
+	}
+	ceph_assert(req_iter != rop.to_read.find(i->first)->second.to_read.end());
+     }
     }
+   }
   }
   for (auto i = op.attrs_read.begin();
        i != op.attrs_read.end();
@@ -1241,8 +1277,9 @@ void ECBackend::handle_sub_read_reply(
         dout(20) << __func__ << " have shard=" << j->first.shard << dendl;
       }
       map<int, vector<pair<int, int>>> dummy_minimum;
-      int err;
-      if ((err = ec_impl->minimum_to_decode(rop.want_to_read[iter->first], have, &dummy_minimum)) < 0) {
+      int err = 0;
+      dout(20) << __func__ << " minimum_to_decode "<< rop.want_to_read[iter->first] << "have:" << have << dendl;
+      if (!rop.to_read.find(iter->first)->second.partial_read && (err = ec_impl->minimum_to_decode(rop.want_to_read[iter->first], have, &dummy_minimum)) < 0) {
 	dout(20) << __func__ << " minimum_to_decode failed" << dendl;
         if (rop.in_progress.empty()) {
 	  // If we don't have enough copies, try other pg_shard_ts if available.
@@ -1705,43 +1742,81 @@ void ECBackend::do_read_op(ReadOp &op)
   int priority = op.priority;
   ceph_tid_t tid = op.tid;
 
-  dout(10) << __func__ << ": starting read " << op << dendl;
+  dout(20) << __func__ << ": starting read " << op << dendl;
 
   map<pg_shard_t, ECSubRead> messages;
   for (map<hobject_t, read_request_t>::iterator i = op.to_read.begin();
        i != op.to_read.end();
        ++i) {
-    bool need_attrs = i->second.want_attrs;
-
-    for (auto j = i->second.need.begin();
-	 j != i->second.need.end();
-	 ++j) {
-      if (need_attrs) {
-	messages[j->first].attrs_to_read.insert(i->first);
-	need_attrs = false;
-      }
-      messages[j->first].subchunks[i->first] = j->second;
-      op.obj_to_source[i->first].insert(j->first);
-      op.source_to_obj[j->first].insert(i->first);
-    }
+    set<int> send_shards;
     for (list<boost::tuple<uint64_t, uint64_t, uint32_t> >::const_iterator j =
 	   i->second.to_read.begin();
 	 j != i->second.to_read.end();
 	 ++j) {
-      pair<uint64_t, uint64_t> chunk_off_len =
-	sinfo.aligned_offset_len_to_chunk(make_pair(j->get<0>(), j->get<1>()));
+           map<int,pair<uint64_t, uint64_t>> wants;
+	   pair<uint64_t, uint64_t> chunk_off_len;
+	   dout(20) << __func__ << ": second.partial_read="<< i->second.partial_read << dendl;
+	   if (i->second.partial_read) {
+	     map<int, set<pair<uint64_t, uint64_t>>> wants_tmp;
+	     HiEcInfo ec_info(ec_impl->get_data_chunk_count(), ec_impl->get_chunk_count(),
+			      ec_impl->get_chunk_mapping(), sinfo.get_chunk_size(),
+			    sinfo.get_stripe_width());
+	     HiGetShardsRangeToRead(make_pair(j->get<0>(), j->get<1>()), ec_info, wants_tmp);
+
+	     for (auto id_chunks : wants_tmp) {
+	       extent_set to_union;
+	       for (auto chunk : id_chunks.second) {
+		   to_union.union_insert(chunk.first, chunk.second);
+	       }
+	       wants.insert(make_pair(id_chunks.first,
+				      make_pair(to_union.begin().get_start(), to_union.begin().get_len())));
+	     }
+	   } else {
+            chunk_off_len =
+	      sinfo.aligned_offset_len_to_chunk(make_pair(j->get<0>(), j->get<1>()));
+	   }
+	   dout(20) << __func__ << "read_request: "<< i->second << " read off: " << j->get<0>()
+		   << "len: " << j->get<1>() << " wants: " << wants << dendl;
       for (auto k = i->second.need.begin();
 	   k != i->second.need.end();
 	   ++k) {
-	messages[k->first].to_read[i->first].push_back(
+	     if (i->second.partial_read) {
+	       if (wants.find(k->first.shard) != wants.end()) {
+		 send_shards.insert(k->first.shard);
+                 messages[k->first].to_read[i->first].push_back(
+		   boost::make_tuple(
+		     wants[k->first.shard].first,
+		     wants[k->first.shard].second,
+		     j->get<2>()));
+	       }
+	       continue;
+	     }
+        messages[k->first].to_read[i->first].push_back(
 	  boost::make_tuple(
 	    chunk_off_len.first,
 	    chunk_off_len.second,
 	    j->get<2>()));
       }
-      ceph_assert(!need_attrs);
+//      ceph_assert(!need_attrs);
+    }
+    bool need_attrs = i->second.want_attrs;
+
+    for (auto j = i->second.need.begin();
+         j != i->second.need.end();
+	 ++j) {
+
+      if (need_attrs) {
+	messages[j->first].attrs_to_read.insert(i->first);
+	need_attrs = false;
+      }
+      if ((!i->second.partial_read) || (i->second.partial_read && (send_shards.find(j->first.shard) != send_shards.end()))) {
+	messages[j->first].subchunks[i->first] = j->second;
+	op.obj_to_source[i->first].insert(j->first);
+	op.source_to_obj[j->first].insert(i->first);
+      }
     }
   }
+  dout(20) << __func__ << " messages size: " << messages.size() << dendl;
 
   for (map<pg_shard_t, ECSubRead>::iterator i = messages.begin();
        i != messages.end();
@@ -1832,8 +1907,12 @@ ECUtil::HashInfoRef ECBackend::get_hash_info(
 void ECBackend::start_rmw(Op *op, PGTransactionUPtr &&t)
 {
   ceph_assert(op);
-
+  dout(20) << __func__ << ": " << *op << dendl;
+  bool cpr = can_partial_read(op->hoid);
+  op->ec_partial_read = cct->_conf->osd_ec_partial_read && cpr;
+  op->ec_partial_write = cct->_conf->osd_ec_partial_write && cpr;
   op->plan = ECTransaction::get_write_plan(
+    op->ec_partial_read && op->ec_partial_write,
     sinfo,
     std::move(t),
     [&](const hobject_t &i) {
@@ -1849,7 +1928,7 @@ void ECBackend::start_rmw(Op *op, PGTransactionUPtr &&t)
     },
     get_parent()->get_dpp());
 
-  dout(10) << __func__ << ": " << *op << dendl;
+  dout(20) << __func__ << ": " << *op << dendl;
 
   waiting_state.push_back(*op);
   check_ops();
@@ -1857,8 +1936,10 @@ void ECBackend::start_rmw(Op *op, PGTransactionUPtr &&t)
 
 bool ECBackend::try_state_to_reads()
 {
-  if (waiting_state.empty())
+  if (waiting_state.empty()) {
+    dout(20) << __func__ << ": waiting_state is empty" << dendl;
     return false;
+  }
 
   Op *op = &(waiting_state.front());
   if (op->requires_rmw() && pipeline_state.cache_invalid()) {
@@ -1891,7 +1972,7 @@ bool ECBackend::try_state_to_reads()
 	to_read_plan_iter == op->plan.to_read.end() ?
 	empty :
 	to_read_plan_iter->second;
-
+	   dout(20) << __func__ << ": hpair.first=" << hpair.first <<" hpair.second:"<<hpair.second<<" to_read_plan:"<<to_read_plan<< cache <<dendl;
       extent_set remote_read = cache.reserve_extents_for_rmw(
 	hpair.first,
 	op->pin,
@@ -1900,24 +1981,27 @@ bool ECBackend::try_state_to_reads()
 
       extent_set pending_read = to_read_plan;
       pending_read.subtract(remote_read);
-
+	dout(20) << __func__ << ": remote_read:"<< remote_read <<" pending_read after subtract:"<<pending_read<< cache << dendl;
       if (!remote_read.empty()) {
 	op->remote_read[hpair.first] = std::move(remote_read);
       }
+
       if (!pending_read.empty()) {
 	op->pending_read[hpair.first] = std::move(pending_read);
       }
     }
   } else {
     op->remote_read = op->plan.to_read;
+    dout(20) << __func__ << ": " << *op << dendl;
   }
 
-  dout(10) << __func__ << ": " << *op << dendl;
+  dout(20) << __func__ << ": " << *op << dendl;
 
   if (!op->remote_read.empty()) {
     ceph_assert(get_parent()->get_pool().allows_ecoverwrites());
     objects_read_async_no_cache(
       op->remote_read,
+     op->ec_partial_read,
       [this, op](map<hobject_t,pair<int, extent_map> > &&results) {
 	for (auto &&i: results) {
 	  op->remote_read_result.emplace(i.first, i.second.second);
@@ -1931,11 +2015,15 @@ bool ECBackend::try_state_to_reads()
 
 bool ECBackend::try_reads_to_commit()
 {
-  if (waiting_reads.empty())
+  if (waiting_reads.empty()) {
+    dout(20) << __func__ << ": waiting_reads is empty" << dendl;
     return false;
+  }
   Op *op = &(waiting_reads.front());
-  if (op->read_in_progress())
+  if (op->read_in_progress()) {
+    dout(20) << __func__ << ": op read in progress " << dendl;
     return false;
+  }
   waiting_reads.pop_front();
   waiting_commit.push_back(*op);
 
@@ -1948,11 +2036,13 @@ bool ECBackend::try_reads_to_commit()
 
   if (op->using_cache) {
     for (auto &&hpair: op->pending_read) {
+      dout(20) << __func__ << " : before cache.get_remaining_extents_for_rmw  " << cache << dendl;
       op->remote_read_result[hpair.first].insert(
 	cache.get_remaining_extents_for_rmw(
 	  hpair.first,
 	  op->pin,
 	  hpair.second));
+      	   dout(20) << __func__ << " : after cache.get_remaining_extents_for_rmw  " << cache << dendl;
     }
     op->pending_read.clear();
   } else {
@@ -1970,7 +2060,44 @@ bool ECBackend::try_reads_to_commit()
   op->trace.event("start ec write");
 
   map<hobject_t,extent_map> written;
+  bool have_append = false;
   if (op->plan.t) {
+
+  HiEcInfo ec_info(ec_impl->get_data_chunk_count(),ec_impl->get_chunk_count(),
+		   ec_impl->get_chunk_mapping(),sinfo.get_chunk_size(),
+		   sinfo.get_stripe_width());
+    set<int> want_to_read;
+    std::map<uint64_t,uint64_t> extents;
+    set<shard_id_t> write_sid;
+
+    for (auto &&ck : op->plan.to_read_chunk_align) {
+      ck.second.move_into(extents);
+
+      HiGetWriteToShards(extents, ec_info, want_to_read);
+
+      interval_set<uint64_t> tmp(extents);
+      ck.second = tmp;
+    }
+
+    for (auto &i : want_to_read) {
+      write_sid.insert(shard_id_t(i));
+    }
+
+    for (auto &&to_read: op->plan.to_read_chunk_align) {
+      map<pg_shard_t, vector<pair<int, int>>> shards;
+      int r = get_min_avail_to_read_shards(
+   to_read.first,
+   want_to_read,
+   false,
+   false,
+   &shards);
+
+   ceph_assert(r == 0);
+   for (const auto &shard: shards) {
+     op->write_to_shards.insert(shard.first);
+   }
+    }
+    
     ECTransaction::generate_transactions(
       op->plan,
       ec_impl,
@@ -1980,9 +2107,11 @@ bool ECBackend::try_reads_to_commit()
       op->log_entries,
       &written,
       &trans,
+      write_sid,
       &(op->temp_added),
       &(op->temp_cleared),
-      get_parent()->get_dpp());
+      get_parent()->get_dpp(),
+      have_append);
   }
 
   dout(20) << __func__ << ": " << cache << dendl;
@@ -2060,6 +2189,7 @@ bool ECBackend::try_reads_to_commit()
     if (*i == get_parent()->whoami_shard()) {
       should_write_local = true;
       local_write_op.claim(sop);
+      dout(20) << __func__ << ": write local sop: "<<sop<<dendl;
     } else {
       MOSDECSubOpWrite *r = new MOSDECSubOpWrite(sop);
       r->pgid = spg_t(get_parent()->primary_spg_t().pgid, i->shard);
@@ -2068,6 +2198,7 @@ bool ECBackend::try_reads_to_commit()
       r->trace = trace;
       get_parent()->send_message_osd_cluster(
 	i->osd, r, get_osdmap_epoch());
+      dout(20) << __func__ << ": send to remote osd sop: "<<sop<<dendl;
     }
   }
   if (should_write_local) {
@@ -2089,11 +2220,15 @@ bool ECBackend::try_reads_to_commit()
 
 bool ECBackend::try_finish_rmw()
 {
-  if (waiting_commit.empty())
+  if (waiting_commit.empty()) {
+    dout(20) << __func__ << ":waiting_commit is empty" << dendl;
     return false;
+  }
   Op *op = &(waiting_commit.front());
-  if (op->write_in_progress())
+  if (op->write_in_progress()) {
+    dout(20) << __func__ << ":op write in progress" << dendl;
     return false;
+  }
   waiting_commit.pop_front();
 
   dout(10) << __func__ << ": " << *op << dendl;
@@ -2117,11 +2252,14 @@ bool ECBackend::try_finish_rmw()
       nop->tid = tid;
       nop->reqid = op->reqid;
       waiting_reads.push_back(*nop);
+      dout(20) << __func__ << ": waiting_reads push nop" << *nop <<dendl;
     }
   }
 
   if (op->using_cache) {
+    dout(20) << __func__ << ": before cache release_write_pin "<< cache << dendl;
     cache.release_write_pin(op->pin);
+    dout(20) << __func__ << ": after cache release_write_pin" << cache << dendl;
   }
   tid_to_op_map.erase(op->tid);
 
@@ -2137,9 +2275,11 @@ bool ECBackend::try_finish_rmw()
 
 void ECBackend::check_ops()
 {
+  dout(20) << __func__ << ": start" <<dendl;
   while (try_state_to_reads() ||
 	 try_reads_to_commit() ||
 	 try_finish_rmw());
+  dout(20) << __func__ << ": finish" <<dendl;
 }
 
 int ECBackend::objects_read_sync(
@@ -2159,26 +2299,36 @@ void ECBackend::objects_read_async(
   Context *on_complete,
   bool fast_read)
 {
-  map<hobject_t,std::list<boost::tuple<uint64_t, uint64_t, uint32_t> > >
+  map<hobject_t,std::pair<std::list<boost::tuple<uint64_t, uint64_t, uint32_t> >, bool> >
     reads;
 
   uint32_t flags = 0;
+  bool object_can_partial_read = false;
+  if (cct->_conf->osd_ec_partial_read) {
+    object_can_partial_read = can_partial_read(hoid);
+  }
+  dout(20) << __func__ << "hobject_t:" << hoid << "partial read is " << object_can_partial_read << dendl;
   extent_set es;
   for (list<pair<boost::tuple<uint64_t, uint64_t, uint32_t>,
 	 pair<bufferlist*, Context*> > >::const_iterator i =
 	 to_read.begin();
        i != to_read.end();
        ++i) {
-    pair<uint64_t, uint64_t> tmp =
-      sinfo.offset_len_to_stripe_bounds(
+    pair<uint64_t, uint64_t> tmp;
+    if (object_can_partial_read) {
+      tmp=sinfo.offset_len_to_chunk_bounds(
 	make_pair(i->first.get<0>(), i->first.get<1>()));
-
+    } else {
+      tmp=sinfo.offset_len_to_stripe_bounds(
+	make_pair(i->first.get<0>(), i->first.get<1>()));
+    }
     es.union_insert(tmp.first, tmp.second);
     flags |= i->first.get<2>();
   }
 
   if (!es.empty()) {
-    auto &offsets = reads[hoid];
+    auto &offsets = reads[hoid].first;
+    reads[hoid].second = object_can_partial_read;
     for (auto j = es.begin();
 	 j != es.end();
 	 ++j) {
@@ -2277,33 +2427,81 @@ struct CallClientContexts :
   ECBackend *ec;
   ECBackend::ClientAsyncReadStatus *status;
   list<boost::tuple<uint64_t, uint64_t, uint32_t> > to_read;
+  bool partial_read;
   CallClientContexts(
     hobject_t hoid,
     ECBackend *ec,
     ECBackend::ClientAsyncReadStatus *status,
-    const list<boost::tuple<uint64_t, uint64_t, uint32_t> > &to_read)
-    : hoid(hoid), ec(ec), status(status), to_read(to_read) {}
+    const list<boost::tuple<uint64_t, uint64_t, uint32_t> > &to_read, bool partial_read = false)
+    : hoid(hoid), ec(ec), status(status), to_read(to_read), partial_read(partial_read) {}
+
+  void reconstruct_shard(unsigned int start, unsigned int count , uint64_t len,
+    map<int, bufferlist> &to_decode, bufferlist *out) {
+
+    auto dpp=ec->get_parent()->get_dpp();
+    ldpp_dout(dpp,20) << "reconstruct_shard start: " << start << "count:" << count << "len:" << len << dendl;
+
+    vector<int> chunk_idx;
+    HiEcInfo ec_info(ec->ec_impl->get_data_chunk_count(), ec->ec_impl->get_chunk_count(),
+		     ec->ec_impl->get_chunk_mapping(), ec->sinfo.get_chunk_size(),
+		     ec->sinfo.get_stripe_width());
+    HiGetReconstructShards(start, count, len, ec_info, chunk_idx);
+
+    for(auto idx : chunk_idx) {
+      bufferlist bl;
+      if (to_decode[idx].length() == 0) {
+	continue;
+      }
+      to_decode[idx].splice(0, ec->sinfo.get_chunk_size(), &bl);
+      out->claim_append(bl);
+    }
+  }
+
+  void reconstruct(pair<uint64_t, uint64_t> in, map<int, bufferlist> &to_decode, bufferlist *out) {
+
+    auto dpp=ec->get_parent()->get_dpp();
+    ldpp_dout(dpp, 20) <<" in: " << in << dendl;
+
+    HiEcInfo ec_info(ec->ec_impl->get_data_chunk_count(), ec->ec_impl->get_chunk_count(),
+		     ec->ec_impl->get_chunk_mapping(), ec->sinfo.get_chunk_size(),
+		     ec->sinfo.get_stripe_width());
+    vector<boost::tuple<unsigned int, unsigned int, unsigned int>> chunk_info;
+    HiReconstructPrepare(ec_info, in, chunk_info);
+
+    for (auto info : chunk_info)
+    	reconstruct_shard(info.get<0>(), info.get<1>(), info.get<2>(), to_decode, out);
+  }
+
   void finish(pair<RecoveryMessages *, ECBackend::read_result_t &> &in) override {
     ECBackend::read_result_t &res = in.second;
     extent_map result;
+    auto dpp=ec->get_parent()->get_dpp();
     if (res.r != 0)
       goto out;
     ceph_assert(res.returned.size() == to_read.size());
     ceph_assert(res.errors.empty());
+    ldpp_dout(dpp, 20) << "read_result_t: " << res << dendl;
     for (auto &&read: to_read) {
-      pair<uint64_t, uint64_t> adjusted =
-	ec->sinfo.offset_len_to_stripe_bounds(
+      bufferlist bl;
+      pair<uint64_t, uint64_t> adjusted;
+      if (!partial_read) {
+       adjusted = ec->sinfo.offset_len_to_stripe_bounds(
+         make_pair(read.get<0>(), read.get<1>()));
+      } else {
+       adjusted = ec->sinfo.offset_len_to_chunk_bounds(
 	  make_pair(read.get<0>(), read.get<1>()));
+      }
       ceph_assert(res.returned.front().get<0>() == adjusted.first &&
 	     res.returned.front().get<1>() == adjusted.second);
       map<int, bufferlist> to_decode;
-      bufferlist bl;
       for (map<pg_shard_t, bufferlist>::iterator j =
 	     res.returned.front().get<2>().begin();
 	   j != res.returned.front().get<2>().end();
 	   ++j) {
 	to_decode[j->first.shard].claim(j->second);
       }
+      ldpp_dout(dpp, 20) << "reconstruct: " << adjusted << " to_decode: " << to_decode << dendl;
+      if (!partial_read) {
       int r = ECUtil::decode(
 	ec->sinfo,
 	ec->ec_impl,
@@ -2313,9 +2511,12 @@ struct CallClientContexts :
         res.r = r;
         goto out;
       }
+     } else {
+      reconstruct(adjusted, to_decode, &bl);
+     }
       bufferlist trimmed;
       trimmed.substr_of(
-	bl,
+   bl,
 	read.get<0>() - adjusted.first,
 	std::min(read.get<1>(),
 	    bl.length() - (read.get<0>() - adjusted.first)));
@@ -2331,7 +2532,7 @@ out:
 
 void ECBackend::objects_read_and_reconstruct(
   const map<hobject_t,
-    std::list<boost::tuple<uint64_t, uint64_t, uint32_t> >
+    std::pair<std::list<boost::tuple<uint64_t, uint64_t, uint32_t> >, bool>
   > &reads,
   bool fast_read,
   GenContextURef<map<hobject_t,pair<int, extent_map> > &&> &&func)
@@ -2357,20 +2558,21 @@ void ECBackend::objects_read_and_reconstruct(
       fast_read,
       &shards);
     ceph_assert(r == 0);
-
+    dout(20) << __func__ << " : want_to_read=" << want_to_read << "    shards=" <<shards<< dendl;
     CallClientContexts *c = new CallClientContexts(
       to_read.first,
       this,
       &(in_progress_client_reads.back()),
-      to_read.second);
+      to_read.second.first,to_read.second.second);
     for_read_op.insert(
       make_pair(
 	to_read.first,
 	read_request_t(
-	  to_read.second,
+	  to_read.second.first,
 	  shards,
 	  false,
-	  c)));
+	  c,
+	  to_read.second.second)));
     obj_want_to_read.insert(make_pair(to_read.first, want_to_read));
   }
 

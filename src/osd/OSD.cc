@@ -27,6 +27,8 @@
 #include <boost/scoped_ptr.hpp>
 #include <boost/range/adaptor/reversed.hpp>
 
+#include <hi_coreutil.h>
+
 #ifdef HAVE_SYS_PARAM_H
 #include <sys/param.h>
 #endif
@@ -3218,6 +3220,8 @@ int OSD::init()
   }
 
   clear_temp_objects();
+
+  HiInit("/etc/ceph/ceph.conf", cct->_conf->name.get_id());
 
   // initialize osdmap references in sharded wq
   for (auto& shard : shards) {
@@ -11500,7 +11504,8 @@ int heap(CephContext& cct, const cmdmap_t& cmdmap, Formatter& f,
   return 0;
 }
  
-}} // namespace ceph::osd_cmds
+}
+} // namespace ceph::osd_cmds
 
 
 std::ostream& operator<<(std::ostream& out, const io_queue& q) {

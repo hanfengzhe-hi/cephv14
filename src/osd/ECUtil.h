@@ -22,6 +22,9 @@
 #include "include/encoding.h"
 #include "common/Formatter.h"
 
+namespace {
+const uint64_t MAX_CHUNK_END = (1ULL << 40);
+}
 namespace ECUtil {
 
 class stripe_info_t {
@@ -36,6 +39,7 @@ public:
   bool logical_offset_is_stripe_aligned(uint64_t logical) const {
     return (logical % stripe_width) == 0;
   }
+
   uint64_t get_stripe_width() const {
     return stripe_width;
   }
@@ -48,6 +52,7 @@ public:
   uint64_t logical_to_next_chunk_offset(uint64_t offset) const {
     return ((offset + stripe_width - 1)/ stripe_width) * chunk_size;
   }
+
   uint64_t logical_to_prev_stripe_offset(uint64_t offset) const {
     return offset - (offset % stripe_width);
   }
@@ -77,6 +82,32 @@ public:
       (in.first - off) + in.second);
     return std::make_pair(off, len);
   }
+  uint64_t logical_to_prev_chunk(uint64_t offset) const {
+    return offset - (offset % chunk_size);
+  }
+
+  uint64_t logical_to_next_chunk(uint64_t offset) const {
+   if (offset > MAX_CHUNK_END || chunk_size > MAX_CHUNK_END) {
+	   return MAX_CHUNK_END;
+   }
+  uint64_t ret = offset % MAX_CHUNK_END;
+  uint64_t redundant = offset % chunk_size;
+  if (redundant != 0) {
+      if (offset - redundant + chunk_size < MAX_CHUNK_END) {
+	  ret = offset - redundant + chunk_size;
+      } else {
+	  ret = MAX_CHUNK_END;
+      }
+  }
+  return ret;
+}
+std::pair<uint64_t, uint64_t> offset_len_to_chunk_bounds(
+  std::pair<uint64_t, uint64_t> in) const {
+  uint64_t off = logical_to_prev_chunk(in.first);
+  uint64_t len = logical_to_next_chunk(
+    (in.first - off) + in.second);
+  return std::make_pair(off, len);
+}
 };
 
 int decode(
