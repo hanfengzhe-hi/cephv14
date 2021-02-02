@@ -1,0 +1,14 @@
+diff --git a/README.md b/README.md
+index 49b6a69..66f000b 100644
+--- a/README.md
++++ b/README.md
+@@ -1,8 +1,6 @@
+-# Ceph - a scalable distributed storage system
+-
++# Ceph - a scalable distributed storage system s
+ Please see http://ceph.com/ for current info.
+ 
+-
+ ## Contributing Code
+ 
+ Most of Ceph is licensed under the LGPL version 2.1.  Some
