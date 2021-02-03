@@ -3323,7 +3323,7 @@ std::vector<Option> get_global_options() {
     .set_default("critical/debug")
     .set_description("The level of kpsec_log, the default is critical/debug"),
 
-    Option("kpsec_log_memlogsize", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    Option("kpsec_log_memlogsize", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(100)
     .set_description("Kpsec_memlog_size, it is the size of memlog_ringbuffer, the default is 100"),
 

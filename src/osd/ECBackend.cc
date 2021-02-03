@@ -1215,7 +1215,7 @@ void ECBackend::handle_sub_read_reply(
 			sinfo.get_stripe_width());
        HiGetRelatedShards(make_pair(req_iter->get<0>(), req_iter->get<1>()), ec_info, shards);
 
-       //get_off_len_shards(req_iter->get<0>(), req_iter->get<1>()), ec_info, shards);
+       //get_off_len_shards(req_iter->get<0>(), req_iter->get<1>(), ec_info, shards);
         dout(20) << __func__ <<" shards:" << shards << "req" << *req_iter << "from:"
 		<< from << "j:" << *j << dendl;
 	if (shards.find(from.shard) != shards.end()) {

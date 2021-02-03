@@ -158,7 +158,7 @@ namespace ECTransaction {
 	      );
 	    will_write.union_insert(
 	      head_start, tail_finish - head_start);
-	    ldpp_dout(dpp, 20) << __func__ << ": head_start != taik_finish " << head_start << "!=" <<tail_finish<< dendl;
+	    ldpp_dout(dpp, 20) << __func__ << ": head_start != tail_finish " << head_start << "!=" <<tail_finish<< dendl;
 	    if (tail_finish > projected_size)
 	      projected_size = tail_finish;
 	  } else {
