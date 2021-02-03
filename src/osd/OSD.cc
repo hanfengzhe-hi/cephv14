@@ -11503,7 +11503,6 @@ int heap(CephContext& cct, const cmdmap_t& cmdmap, Formatter& f,
   
   return 0;
 }
- 
 }
 } // namespace ceph::osd_cmds
 
